@@ -41,6 +41,7 @@ employer or client, or anything not drawn from public material.
     as invoice charges
   - `plans.json` subscription plans (data). **[GUESS: all plan numbers]**
   - `invoice.py` invoices, drafts, and `close_period` (the one-way freeze)
+  - `revrec.py`  revenue recognition schedule and deferred revenue rollforward
   - `reconcile.py` the daily completeness and accuracy check
   - `price_books/*.json` versioned price books (data, not code). All numbers
     are synthetic. **[GUESS: v1 prices, tiers and free allowances; v2
@@ -115,7 +116,16 @@ to 7.
      did happen. **[GUESS]**
 7. **Reconcile.** A daily job checks that raw ledger units = aggregated units
    = invoiced units for each customer and period, and that ingest counts add
-   up to inputs. Any gap is a failure, not a warning.
+   up to inputs. It also checks credits and the revenue
+   rollforward. Any gap is a failure, not a warning.
+8. **Recognize.** `revrec.py` reads billing results and writes nothing.
+   Usage billed at API rates is revenue in the period it is billed;
+   subscription fees are recognized evenly over the term (share rounded down,
+   remainder in the last period); prepaid credit is deferred until drawn,
+   and what is left at expiry is breakage once the grant's last period has
+   closed. Usage covered by included credit earns no revenue of its own.
+   Billed + prepaid cash = recognized + deferred, through every period.
+   **[GUESS]** on all of these, simplified from ASC 606.
 
 ## Billing invariants (never break these)
 
@@ -168,6 +178,7 @@ pytest -q                                   # run tests
 python scripts/generate_usage.py -n 1000 --dup-rate 0.05 --db usage.db
 python scripts/close_period.py --db usage.db --period 2026-10   # one-way
 python scripts/reconcile.py --db usage.db   # exits 1 on any gap
+python scripts/revrec.py --db usage.db --through 2026-11   # revenue + deferred
 python scripts/diff_pricing.py --old v1 --new candidate.json   # pricing PRs
 uvicorn app.main:app --reload               # run the API
 ```

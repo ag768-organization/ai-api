@@ -7,6 +7,7 @@ For each customer and period, after usage has been rated:
    included credit comes off the usage total first. It never carries over.
 3. **Prepaid credit.** Then prepaid grants usable in the period, soonest to
    expire first, draw down until the usage is covered or the grants run out.
+   A grant whose last period is closed has expired and is never drawn again.
 4. **Overage.** Whatever usage is left stays on the invoice at API rates.
 
 Credits only ever offset usage, never the subscription fee, so an invoice
@@ -115,7 +116,11 @@ def allocate(conn: sqlite3.Connection, books: dict[str, rating.PriceBook] | None
     grants_by_customer: dict[str, list[CreditGrant]] = defaultdict(list)
     all_grants = grants(conn)
     for g in all_grants:
-        grants_by_customer[g.customer_id].append(g)
+        # Once a grant's last period has closed it has expired for good: the
+        # leftover is recognized as breakage (revrec.py), so no open period,
+        # even an earlier one closed later, may draw on it any more.
+        if g.last_period not in closed:
+            grants_by_customer[g.customer_id].append(g)
 
     result = Allocation()
     result.usage.update(frozen_usage_totals(conn))
