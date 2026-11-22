@@ -1,0 +1,11 @@
+{
+  "version": "plans-v1",
+  "currency": "USD",
+  "notes": "GUESS: every number here is synthetic, made up for this project. fee is charged for the whole term, in advance, in the term's first period. included_credit is usage credit per period: it is spent before prepaid credits and does not carry over.",
+  "plans": {
+    "basic":       {"fee": "12.00",  "term_months": 1,  "included_credit": "0.00"},
+    "plus":        {"fee": "60.00",  "term_months": 1,  "included_credit": "40.00"},
+    "plus_annual": {"fee": "600.00", "term_months": 12, "included_credit": "40.00"},
+    "team":        {"fee": "150.00", "term_months": 1,  "included_credit": "120.00"}
+  }
+}

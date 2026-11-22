@@ -35,6 +35,11 @@ employer or client, or anything not drawn from public material.
     aggregates, invoice lines, invoices)
   - `aggregate.py` billing-period assignment (incl. late events) and totals
   - `rating.py`  price book loading and rating; `diff_books` for differential runs
+  - `subscriptions.py` accounts (postpaid / prepaid), plan terms and
+    prepaid credit grants: append-only records, no billing logic
+  - `credits.py` subscription fees, included credit and prepaid draw-down
+    as invoice charges
+  - `plans.json` subscription plans (data). **[GUESS: all plan numbers]**
   - `invoice.py` invoices, drafts, and `close_period` (the one-way freeze)
   - `reconcile.py` the daily completeness and accuracy check
   - `price_books/*.json` versioned price books (data, not code). All numbers
@@ -93,7 +98,21 @@ to 7.
      refuses to rate cache or batch tokens rather than billing them at zero.
      **[GUESS]**
 6. **Invoice.** Line items and a total per customer per period. The invoice
-   total equals the sum of its line items exactly.
+   total equals the sum of its usage lines and charges exactly.
+   - Charges, in order: a subscription term's whole fee in its first period
+     (billed in advance); then included credit for the active term, then
+     prepaid credit (soonest-expiring grant first), both only against
+     usage, never against the fee. What's left is overage at API rates.
+     **[GUESS]**
+   - Included credit expires at the end of each period. A prepaid grant is
+     usable from the period it was bought in for 12 periods, then expires.
+     **[GUESS]**
+   - Closed periods' charges are frozen in `invoice_charges`. Open periods
+     draw from what frozen draws left, in date order, so a grant can never
+     be overdrawn whatever order periods close in.
+   - A `prepaid` account is refused at the API (HTTP 402) once its credit
+     is gone; nothing is emitted. Ingest still records every event that
+     did happen. **[GUESS]**
 7. **Reconcile.** A daily job checks that raw ledger units = aggregated units
    = invoiced units for each customer and period, and that ingest counts add
    up to inputs. Any gap is a failure, not a warning.

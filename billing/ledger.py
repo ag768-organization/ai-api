@@ -105,10 +105,57 @@ CREATE TABLE IF NOT EXISTS period_aggregate_units (
     PRIMARY KEY (period, customer_id, model, category)
 );
 
+-- Customer accounts. billing_mode 'postpaid' (the default for a customer
+-- with no row) bills usage in arrears; 'prepaid' stops serving requests once
+-- included and prepaid credits run out.
+CREATE TABLE IF NOT EXISTS accounts (
+    customer_id  TEXT PRIMARY KEY,
+    billing_mode TEXT NOT NULL CHECK (billing_mode IN ('postpaid', 'prepaid')),
+    opened_at    TEXT NOT NULL
+);
+
+-- A subscription is one fixed term of a plan. Renewal is a new row, so a
+-- row never changes. The plan's terms are copied in at signup, so a later
+-- plan change can't alter a running subscription.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    subscription_id TEXT PRIMARY KEY,
+    customer_id     TEXT NOT NULL,
+    plan_id         TEXT NOT NULL,
+    fee             TEXT NOT NULL,      -- whole-term fee, Decimal dollars, billed in advance
+    included_credit TEXT NOT NULL,      -- usage credit per period, Decimal dollars
+    term_months     INTEGER NOT NULL CHECK (term_months > 0),
+    start_period    TEXT NOT NULL,      -- first period of the term ('YYYY-MM')
+    created_at      TEXT NOT NULL
+);
+
+-- Prepaid credit purchases. Usable from first_period through last_period
+-- inclusive; whatever is left after last_period has expired.
+CREATE TABLE IF NOT EXISTS credit_grants (
+    grant_id     TEXT PRIMARY KEY,
+    customer_id  TEXT NOT NULL,
+    amount       TEXT NOT NULL,         -- Decimal dollars, cents
+    granted_at   TEXT NOT NULL,
+    first_period TEXT NOT NULL,
+    last_period  TEXT NOT NULL
+);
+
+-- Non-usage invoice lines frozen at close: subscription fees (positive) and
+-- credits applied against usage (negative). ref is the subscription_id or
+-- grant_id the charge comes from.
+CREATE TABLE IF NOT EXISTS invoice_charges (
+    period      TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    kind        TEXT NOT NULL CHECK (kind IN
+                    ('subscription_fee', 'included_credit', 'prepaid_credit')),
+    ref         TEXT NOT NULL,
+    amount      TEXT NOT NULL,
+    PRIMARY KEY (period, customer_id, kind, ref)
+);
+
 CREATE TABLE IF NOT EXISTS invoices (
     period      TEXT NOT NULL,
     customer_id TEXT NOT NULL,
-    total       TEXT NOT NULL,             -- sum of line amounts, never re-rounded
+    total       TEXT NOT NULL,             -- usage lines + charges, never re-rounded
     line_count  INTEGER NOT NULL,
     PRIMARY KEY (period, customer_id)
 );
@@ -116,7 +163,8 @@ CREATE TABLE IF NOT EXISTS invoices (
 
 # Every billing table is append-only, enforced the same way as usage_events.
 APPEND_ONLY_TABLES = ("ingest_batches", "period_closes", "period_aggregates",
-                      "period_aggregate_units", "invoice_lines", "invoices")
+                      "period_aggregate_units", "invoice_lines", "invoices",
+                      "accounts", "subscriptions", "credit_grants", "invoice_charges")
 SCHEMA += "".join(
     f"""
 CREATE TRIGGER IF NOT EXISTS {t}_no_update BEFORE UPDATE ON {t}

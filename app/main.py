@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from billing import ledger
+from billing import aggregate, credits, ledger, subscriptions
 from billing.ingest import ingest
 
 app = FastAPI(title="Fake AI API", version="0.1.0")
@@ -39,7 +39,16 @@ class CompletionRequest(BaseModel):
 def complete(req: CompletionRequest, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
     """Pretend to run a model. Token counts are a crude word count (GUESS:
     good enough for a fake). The usage event goes through the same ingest
-    path as everything else, so there's one way into the ledger."""
+    path as everything else, so there's one way into the ledger.
+
+    A prepaid customer with no credit left is refused before the model runs,
+    so no usage happens and no event is emitted. Usage already in flight can
+    still take the balance below zero; that remainder is billed as overage
+    in arrears. **[GUESS]**"""
+    if subscriptions.billing_mode(conn, req.customer_id) == "prepaid":
+        period = aggregate.period_of(datetime.now(timezone.utc))
+        if credits.remaining_credit(conn, req.customer_id, period) <= 0:
+            raise HTTPException(status_code=402, detail="prepaid credit exhausted")
     input_tokens = len(req.prompt.split())
     output_tokens = input_tokens * 2
     event = {
