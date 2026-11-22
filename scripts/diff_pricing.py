@@ -30,16 +30,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--new", required=True, help="version name or JSON path")
     p.add_argument("-n", type=int, default=5_000)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--cache-rate", type=float, default=0.0,
+                   help="share of events with cache tokens (both books must price them)")
+    p.add_argument("--batch-rate", type=float, default=0.0)
     a = p.parse_args(argv)
 
     conn = ledger.connect(":memory:")
-    ingest(conn, emit.generate(a.n, seed=a.seed))
+    ingest(conn, emit.generate(a.n, seed=a.seed, cache_rate=a.cache_rate,
+                               batch_rate=a.batch_rate))
     old, new = book(a.old), book(a.new)
     diffs = rating.diff_books(aggregate.aggregate(conn), old, new)
     old_total = sum((d.old_total for d in diffs), Decimal(0))
     new_total = sum((d.new_total for d in diffs), Decimal(0))
     print(json.dumps({
         "old": old.version, "new": new.version, "events": a.n, "seed": a.seed,
+        "cache_rate": a.cache_rate, "batch_rate": a.batch_rate,
         "invoices": len(diffs), "changed": sum(1 for d in diffs if d.delta),
         "old_total": str(old_total), "new_total": str(new_total),
         "delta": str(new_total - old_total),

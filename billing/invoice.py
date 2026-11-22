@@ -85,6 +85,13 @@ def close_period(conn: sqlite3.Connection, period: str, *,
               u.event_count, u.late_count) for u in usage],
         )
         conn.executemany(
+            "INSERT INTO period_aggregate_units (period, customer_id, model, category, tokens)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [(u.period, u.customer_id, u.model, cat, u.tokens(cat)) for u in usage
+             for cat in aggregate.CATEGORIES
+             if cat not in aggregate.COLUMN_CATEGORIES and u.tokens(cat)],
+        )
+        conn.executemany(
             "INSERT INTO invoice_lines (period, customer_id, model, category, tokens,"
             " free_tokens, amount, price_book_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [(ln.period, ln.customer_id, ln.model, ln.category, ln.tokens, ln.free_tokens,
@@ -105,6 +112,24 @@ def close_period(conn: sqlite3.Connection, period: str, *,
     return invoices
 
 
+def frozen_usage(conn: sqlite3.Connection, period: str) -> list[aggregate.Usage]:
+    """The aggregates of a closed period, as frozen at close."""
+    extra: dict[tuple[str, str], dict[str, int]] = {}
+    for r in conn.execute(
+            "SELECT customer_id, model, category, tokens FROM period_aggregate_units"
+            " WHERE period = ?", (period,)):
+        extra.setdefault((r["customer_id"], r["model"]), {})[f"{r['category']}_tokens"] = r["tokens"]
+    rows = [aggregate.Usage(**dict(row), **extra.pop((row["customer_id"], row["model"]), {}))
+            for row in conn.execute(
+                "SELECT period, customer_id, model, input_tokens, output_tokens,"
+                " event_count, late_count FROM period_aggregates WHERE period = ?"
+                " ORDER BY customer_id, model", (period,))]
+    # Units with no period_aggregates row still count, so reconcile sees them.
+    rows += [aggregate.Usage(period, c, m, 0, 0, 0, 0, **units)
+             for (c, m), units in sorted(extra.items())]
+    return rows
+
+
 def stored(conn: sqlite3.Connection, period: str) -> list[Invoice]:
     """The frozen invoices of a closed period, as written at close."""
     lines = [
@@ -115,4 +140,9 @@ def stored(conn: sqlite3.Connection, period: str) -> list[Invoice]:
             "SELECT * FROM invoice_lines WHERE period = ?"
             " ORDER BY customer_id, model, category", (period,))
     ]
+    # Same line order as rating.rate, so a stored invoice equals the one built
+    # at close. Categories the code doesn't know sort last (reconcile flags them).
+    order = {c: i for i, c in enumerate(aggregate.CATEGORIES)}
+    lines.sort(key=lambda ln: (ln.customer_id, ln.model, order.get(ln.category, len(order)),
+                               ln.category))
     return build(lines)

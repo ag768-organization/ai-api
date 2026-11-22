@@ -61,9 +61,25 @@ def billing_period(occurred_at: datetime, received_at: datetime,
     return period
 
 
+# Token categories. The four base categories come straight from an event's
+# token fields; a batch event's tokens go to the `batch_` version of each.
+BASE_CATEGORIES = ("input", "output", "cache_write", "cache_read")
+CATEGORIES = BASE_CATEGORIES + tuple(f"batch_{c}" for c in BASE_CATEGORIES)
+# Categories frozen in period_aggregates' own columns; the rest go to
+# period_aggregate_units.
+COLUMN_CATEGORIES = ("input", "output")
+
+
+def category_for(base: str, batch: bool) -> str:
+    return f"batch_{base}" if batch else base
+
+
 @dataclass(frozen=True)
 class Usage:
-    """Aggregated units for one customer, model and billing period."""
+    """Aggregated units for one customer, model and billing period.
+
+    `input_tokens` and `output_tokens` are standard (non-batch) calls only;
+    every other category has its own field and defaults to zero."""
 
     period: str
     customer_id: str
@@ -72,10 +88,21 @@ class Usage:
     output_tokens: int
     event_count: int
     late_count: int
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    batch_input_tokens: int = 0
+    batch_output_tokens: int = 0
+    batch_cache_write_tokens: int = 0
+    batch_cache_read_tokens: int = 0
+
+    def tokens(self, category: str) -> int:
+        if category not in CATEGORIES:
+            raise KeyError(category)
+        return getattr(self, f"{category}_tokens")
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return sum(self.tokens(c) for c in CATEGORIES)
 
 
 @dataclass(frozen=True)
@@ -87,6 +114,14 @@ class AssignedEvent:
     output_tokens: int
     period: str
     late: bool
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    batch: bool = False
+
+    def units(self) -> dict[str, int]:
+        """Tokens by category for this one event."""
+        return {category_for(base, self.batch): getattr(self, f"{base}_tokens")
+                for base in BASE_CATEGORIES}
 
 
 def assign(conn: sqlite3.Connection) -> list[AssignedEvent]:
@@ -95,25 +130,36 @@ def assign(conn: sqlite3.Connection) -> list[AssignedEvent]:
     out = []
     for r in conn.execute(
         "SELECT event_id, customer_id, model, input_tokens, output_tokens,"
+        " cache_write_tokens, cache_read_tokens, batch,"
         " occurred_at, received_at FROM usage_events ORDER BY seq"
     ):
         occurred = datetime.fromisoformat(r["occurred_at"])
         period = billing_period(occurred, datetime.fromisoformat(r["received_at"]), closed)
         out.append(AssignedEvent(r["event_id"], r["customer_id"], r["model"],
                                  r["input_tokens"], r["output_tokens"],
-                                 period, period != period_of(occurred)))
+                                 period, period != period_of(occurred),
+                                 r["cache_write_tokens"], r["cache_read_tokens"],
+                                 bool(r["batch"])))
     return out
 
 
 def summarise(events: Iterable[AssignedEvent]) -> list[Usage]:
-    totals: dict[tuple[str, str, str], list[int]] = {}
+    tokens: dict[tuple[str, str, str], dict[str, int]] = {}
+    counts: dict[tuple[str, str, str], list[int]] = {}
     for e in events:
-        t = totals.setdefault((e.period, e.customer_id, e.model), [0, 0, 0, 0])
-        t[0] += e.input_tokens
-        t[1] += e.output_tokens
-        t[2] += 1
-        t[3] += int(e.late)
-    return [Usage(p, c, m, *t) for (p, c, m), t in sorted(totals.items())]
+        key = (e.period, e.customer_id, e.model)
+        t = tokens.setdefault(key, dict.fromkeys(CATEGORIES, 0))
+        for cat, n in e.units().items():
+            t[cat] += n
+        c = counts.setdefault(key, [0, 0])
+        c[0] += 1
+        c[1] += int(e.late)
+    return [Usage(p, cu, m, input_tokens=tokens[(p, cu, m)]["input"],
+                  output_tokens=tokens[(p, cu, m)]["output"],
+                  event_count=counts[(p, cu, m)][0], late_count=counts[(p, cu, m)][1],
+                  **{f"{cat}_tokens": n for cat, n in tokens[(p, cu, m)].items()
+                     if cat not in COLUMN_CATEGORIES})
+            for (p, cu, m) in sorted(tokens)]
 
 
 def aggregate(conn: sqlite3.Connection, period: str | None = None) -> list[Usage]:

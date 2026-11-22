@@ -38,7 +38,8 @@ employer or client, or anything not drawn from public material.
   - `invoice.py` invoices, drafts, and `close_period` (the one-way freeze)
   - `reconcile.py` the daily completeness and accuracy check
   - `price_books/*.json` versioned price books (data, not code). All numbers
-    are synthetic. **[GUESS: v1 prices, tiers and free allowances]**
+    are synthetic. **[GUESS: v1 prices, tiers and free allowances; v2
+    cache multipliers and batch multiplier]**
 - `app/` is the FastAPI app (fake model endpoint + ingest endpoint).
 - `scripts/` holds command-line helpers, e.g. `generate_usage.py`.
 - `tests/` is the pytest suite, with `tests/property/` (Hypothesis,
@@ -55,9 +56,15 @@ to 7.
 
 1. **Emit.** Every API call produces a usage event: `event_id` (UUID),
    `customer_id` (`cust_...`), `model` (from a fixed catalogue),
-   `input_tokens`, `output_tokens`, `occurred_at` (UTC). `total_tokens` is
-   derived. Input and output are split because they are usually priced
-   differently.
+   `input_tokens`, `output_tokens`, `occurred_at` (UTC), plus optional
+   `cache_write_tokens`, `cache_read_tokens` (default 0) and `batch`
+   (default false). `total_tokens` is derived. Token types are split because
+   they are priced differently.
+   - Fields added after Phase 2 join `payload_hash` only when they differ
+     from their default, so an old event keeps its hash and re-sending it is
+     still a duplicate. Any new event field must follow the same rule, and
+     the ledger gets it through `ledger._migrate` (`ALTER TABLE ADD COLUMN`
+     with a constant default), never by rebuilding the table.
 2. **Ingest.** Validate (schema, non-negative integer tokens under a per-call
    cap, known model, aware UTC timestamp not in the future beyond a small
    skew), then de-duplicate by `event_id`. Report accepted / duplicate /
@@ -79,6 +86,12 @@ to 7.
      comes off first; tier limits count tokens after it. **[GUESS]**
    - A period is rated on the book with the latest `effective_from` on or
      before it; no mid-period price changes. **[GUESS]**
+   - From v2, cache writes and reads are the input rate times a per-model
+     multiplier, and a batch call multiplies every category by one
+     `batch_multiplier` (stacking with cache). Derived categories get no free
+     allowance and count their own tiers. A book without `modifiers` (v1)
+     refuses to rate cache or batch tokens rather than billing them at zero.
+     **[GUESS]**
 6. **Invoice.** Line items and a total per customer per period. The invoice
    total equals the sum of its line items exactly.
 7. **Reconcile.** A daily job checks that raw ledger units = aggregated units

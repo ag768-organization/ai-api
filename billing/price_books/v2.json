@@ -1,0 +1,33 @@
+{
+  "version": "v2",
+  "effective_from": "2026-11",
+  "currency": "USD",
+  "notes": "GUESS: every number here is synthetic, made up for this project. Base input and output rates, tiers and free allowances are unchanged from v1. New in v2: modifiers. cache_write and cache_read are priced as the model's input rate times a per-model multiplier, tier for tier; batch_multiplier applies to every category of a batch call, on top of any cache multiplier. Derived categories have no free allowance.",
+  "modifiers": {
+    "batch_multiplier": "0.60",
+    "cache": {
+      "tiny-1": {"write_multiplier": "1.30", "read_multiplier": "0.15"},
+      "small-1": {"write_multiplier": "1.30", "read_multiplier": "0.12"},
+      "medium-1": {"write_multiplier": "1.30", "read_multiplier": "0.10"},
+      "large-1": {"write_multiplier": "1.30", "read_multiplier": "0.08"}
+    }
+  },
+  "models": {
+    "tiny-1": {
+      "input":  {"free_tokens": 50000, "tiers": [{"up_to": 1000000, "per_million": "0.20"}, {"up_to": null, "per_million": "0.16"}]},
+      "output": {"free_tokens": 25000, "tiers": [{"up_to": 1000000, "per_million": "0.80"}, {"up_to": null, "per_million": "0.64"}]}
+    },
+    "small-1": {
+      "input":  {"free_tokens": 50000, "tiers": [{"up_to": 1000000, "per_million": "1.00"}, {"up_to": null, "per_million": "0.80"}]},
+      "output": {"free_tokens": 25000, "tiers": [{"up_to": 1000000, "per_million": "4.00"}, {"up_to": null, "per_million": "3.20"}]}
+    },
+    "medium-1": {
+      "input":  {"free_tokens": 0, "tiers": [{"up_to": 1000000, "per_million": "3.00"}, {"up_to": null, "per_million": "2.40"}]},
+      "output": {"free_tokens": 0, "tiers": [{"up_to": 1000000, "per_million": "12.00"}, {"up_to": null, "per_million": "9.60"}]}
+    },
+    "large-1": {
+      "input":  {"free_tokens": 0, "tiers": [{"up_to": 1000000, "per_million": "12.00"}, {"up_to": null, "per_million": "9.60"}]},
+      "output": {"free_tokens": 0, "tiers": [{"up_to": 1000000, "per_million": "48.00"}, {"up_to": null, "per_million": "38.40"}]}
+    }
+  }
+}
