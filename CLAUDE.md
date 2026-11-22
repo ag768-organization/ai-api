@@ -1,0 +1,148 @@
+# CLAUDE.md
+
+Guidance for Claude Code working in this repository.
+
+> **[GUESS]** marks an assumption nobody has confirmed yet. Where the code
+> already decides a question, the code wins. Delete a marker once settled.
+
+## What this is
+
+A small, fake "AI API" that bills customers per token. The product is a
+learning vehicle: the billing pipeline is treated as a high-risk,
+SOX-relevant path (revenue completeness and accuracy), and every change
+goes through a controlled change-management pipeline.
+
+All data is synthetic. Do not add real customer data, real pricing from any
+employer or client, or anything not drawn from public material.
+
+## Stack
+
+- Python 3.11+, FastAPI, Pydantic v2, SQLite (stdlib `sqlite3`), pytest.
+- No ORM. SQL lives next to the code that uses it.
+- pip + `pyproject.toml` (editable install with the `dev` extra).
+- Planned, not yet installed: Hypothesis (property tests, Phase 2), ruff
+  (lint and format) and mypy (type checks). **[GUESS: ruff and mypy]**
+
+## Layout
+
+- `billing/` is the high-risk path (see "High-risk paths").
+  - `events.py`  usage event schema and validation rules
+  - `emit.py`    fake usage generator (seeded)
+  - `ingest.py`  validation + de-duplication by `event_id`
+  - `ledger.py`  append-only SQLite ledger of raw events
+  - Phase 2 adds `aggregate.py`, `rating.py`, `invoice.py`, `reconcile.py`,
+    and versioned price books (data, not code). **[GUESS: file names]**
+- `app/` is the FastAPI app (fake model endpoint + ingest endpoint).
+- `scripts/` holds command-line helpers, e.g. `generate_usage.py`.
+- `tests/` is the pytest suite. Phase 2 adds `tests/property/` and
+  `tests/differential/`. **[GUESS]**
+- `.github/` is high risk: CI workflows and CODEOWNERS (Phase 4).
+- `.claude/` holds skills (`verify`), hooks and settings (Phases 3 and 5).
+- `REVIEW.md` holds review rules, read from `main`, never from the PR (Phase 4).
+
+## Pipeline
+
+Each step has one module and one job. A later step never reaches back and
+changes an earlier step's data. Phase 1 builds steps 1 to 3.
+
+1. **Emit.** Every API call produces a usage event: `event_id` (UUID),
+   `customer_id` (`cust_...`), `model` (from a fixed catalogue),
+   `input_tokens`, `output_tokens`, `occurred_at` (UTC). `total_tokens` is
+   derived. Input and output are split because they are usually priced
+   differently.
+2. **Ingest.** Validate (schema, non-negative integer tokens under a per-call
+   cap, known model, aware UTC timestamp not in the future beyond a small
+   skew), then de-duplicate by `event_id`. Report accepted / duplicate /
+   conflict / invalid counts.
+3. **Ledger.** Raw events go into the append-only `usage_events` table.
+4. **Aggregate.** Total tokens per customer, per model, per billing period.
+   - Billing period: calendar month, UTC. **[GUESS]**
+   - Late events: an event whose `occurred_at` falls in a period that is
+     already closed is billed in the next open period and flagged late.
+     Closed periods are never reopened. The ledger keeps the true
+     `occurred_at` and `received_at`, so the shift is visible and auditable.
+5. **Rate.** Apply price per million tokens per model (input and output
+   separately), volume tiers and any free allowance. Every rated line records
+   the price book version used.
+6. **Invoice.** Line items and a total per customer per period. The invoice
+   total equals the sum of its line items exactly.
+7. **Reconcile.** A daily job checks that raw ledger units = aggregated units
+   = invoiced units for each customer and period, and that ingest counts add
+   up to inputs. Any gap is a failure, not a warning.
+
+## Billing invariants (never break these)
+
+1. **Ledger is append-only.** No `UPDATE` or `DELETE` on `usage_events`, ever.
+   SQLite triggers enforce this; do not drop or bypass them. Corrections are
+   new events: a **reversal event** has its own new `event_id` and points
+   back to the original through a `reverses_event_id` field. A reversal must
+   reference an event that exists in the ledger, and an event can be reversed
+   at most once. (Reversals arrive in a later phase.)
+2. **Exactly-once billing per `event_id`.** Re-sending an identical event is a
+   no-op. Re-sending the same `event_id` with a different payload is a
+   *conflict*: reject it and surface it, never overwrite.
+3. **Token counts are integers.** No floats anywhere in usage or money.
+   Money is `Decimal` end to end, rounded to cents once per line item with
+   `ROUND_HALF_UP`. Never round intermediate values, and never round the
+   invoice total separately: it is the sum of already-rounded line items.
+4. **Timestamps are timezone-aware UTC.** Naive datetimes are rejected.
+5. **Every rejected event is counted, not silently dropped.** Ingest returns
+   accepted / duplicate / conflict / invalid counts so reconciliation can
+   account for every input.
+
+Added for Phase 2 (from the other draft):
+
+6. **Invoice total == sum of rated usage** for the period.
+7. **Replay never changes totals.** Replaying the same events, in any order
+   and with any number of duplicates, leaves every total unchanged.
+8. **Every ledger event lands in exactly one billing period.**
+9. **Reconciliation reports zero gaps** on generator output.
+
+## High-risk paths
+
+`billing/` and `.github/` are high risk. From Phase 4, CODEOWNERS requires an
+approving review from the reviewer account on any change there.
+
+When a change touches either path:
+
+- Say so at the top of the PR description and explain the billing impact.
+- Add or update the test first; it must fail without the change.
+- Run the full test suite (and `/verify` once it exists) before committing.
+- If pricing or rating changed, run the differential test against the
+  previous price book and put the summary in the PR.
+- Do not weaken a CI check, CODEOWNERS rule, branch protection or hook to get
+  a change through. Raise it instead.
+- Do not add a dependency to `billing/` without saying why in the PR.
+- Do not change `REVIEW.md` and billing code in the same PR.
+
+## Commands
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
+pytest -q                                   # run tests
+python scripts/generate_usage.py -n 1000 --dup-rate 0.05 --db usage.db
+uvicorn app.main:app --reload               # run the API
+```
+
+## Testing rules
+
+- Every change ships with tests. A bug fix starts with a failing test that
+  reproduces the bug.
+- Do not edit, weaken, skip, xfail or delete an existing test to make a change
+  pass; explain why the test is wrong instead.
+- Tests use a fresh in-memory or temp SQLite database, never a real `.db`
+  file in the repo.
+- The generator takes a seed, so any failure can be reproduced.
+- Phase 2: property tests (Hypothesis) cover invariants 6 to 9; differential
+  tests run old and new pricing on the same generated usage and compare
+  totals per customer.
+
+## Commits and PRs
+
+- Never push to `main` directly. Work on a branch and open a PR.
+- **Ask before pushing, opening PRs, or changing `.github/` and CODEOWNERS.**
+- Run `pytest -q` before every commit and say in the commit message what ran.
+  From Phase 5, each message ends with `Verified: tests | verify | none`.
+  Never claim a check that did not run.
+- Keep PRs small, one pipeline step per PR where possible.
