@@ -3,6 +3,10 @@
 The ledger is the system of record for billable usage. It is insert-only:
 SQLite triggers abort any UPDATE or DELETE, so a bug (or a person) can't
 quietly change history. Corrections will be new events in a later phase.
+
+The same database also holds the downstream billing tables (ingest batch
+counts, period closes, frozen aggregates and invoices). They are append-only
+too: once a period is closed, nothing about it can change.
 """
 from __future__ import annotations
 
@@ -36,7 +40,74 @@ BEFORE DELETE ON usage_events
 BEGIN
     SELECT RAISE(ABORT, 'usage_events is append-only: DELETE not allowed');
 END;
+
+-- One row per ingest batch, so reconciliation can prove every input was
+-- counted: received = accepted + duplicate + conflict + invalid.
+CREATE TABLE IF NOT EXISTS ingest_batches (
+    batch_seq   INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at TEXT    NOT NULL,
+    received    INTEGER NOT NULL,
+    accepted    INTEGER NOT NULL,
+    duplicate   INTEGER NOT NULL,
+    conflict    INTEGER NOT NULL,
+    invalid     INTEGER NOT NULL
+);
+
+-- A closed billing period. Closing is one-way: no UPDATE or DELETE, so a
+-- closed period can never be reopened.
+CREATE TABLE IF NOT EXISTS period_closes (
+    period             TEXT PRIMARY KEY,   -- 'YYYY-MM' (UTC calendar month)
+    closed_at          TEXT NOT NULL,
+    price_book_version TEXT NOT NULL
+);
+
+-- Aggregates frozen at close: total units per customer, model, period.
+CREATE TABLE IF NOT EXISTS period_aggregates (
+    period        TEXT    NOT NULL,
+    customer_id   TEXT    NOT NULL,
+    model         TEXT    NOT NULL,
+    input_tokens  INTEGER NOT NULL CHECK (input_tokens  >= 0),
+    output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+    event_count   INTEGER NOT NULL,
+    late_count    INTEGER NOT NULL,
+    PRIMARY KEY (period, customer_id, model)
+);
+
+-- Invoice lines frozen at close. amount is a Decimal string in dollars,
+-- already rounded to cents (never a float).
+CREATE TABLE IF NOT EXISTS invoice_lines (
+    period             TEXT    NOT NULL,
+    customer_id        TEXT    NOT NULL,
+    model              TEXT    NOT NULL,
+    category           TEXT    NOT NULL,   -- token category: input, output
+    tokens             INTEGER NOT NULL CHECK (tokens >= 0),
+    free_tokens        INTEGER NOT NULL CHECK (free_tokens >= 0),
+    amount             TEXT    NOT NULL,
+    price_book_version TEXT    NOT NULL,
+    PRIMARY KEY (period, customer_id, model, category)
+);
+
+CREATE TABLE IF NOT EXISTS invoices (
+    period      TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    total       TEXT NOT NULL,             -- sum of line amounts, never re-rounded
+    line_count  INTEGER NOT NULL,
+    PRIMARY KEY (period, customer_id)
+);
 """
+
+# Every billing table is append-only, enforced the same way as usage_events.
+APPEND_ONLY_TABLES = ("ingest_batches", "period_closes", "period_aggregates",
+                      "invoice_lines", "invoices")
+SCHEMA += "".join(
+    f"""
+CREATE TRIGGER IF NOT EXISTS {t}_no_update BEFORE UPDATE ON {t}
+BEGIN SELECT RAISE(ABORT, '{t} is append-only: UPDATE not allowed'); END;
+CREATE TRIGGER IF NOT EXISTS {t}_no_delete BEFORE DELETE ON {t}
+BEGIN SELECT RAISE(ABORT, '{t} is append-only: DELETE not allowed'); END;
+"""
+    for t in APPEND_ONLY_TABLES
+)
 
 
 class LedgerImmutableError(Exception):
@@ -97,3 +168,4 @@ def total_tokens(conn: sqlite3.Connection) -> int:
     return conn.execute(
         "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) FROM usage_events"
     ).fetchone()[0]
+
