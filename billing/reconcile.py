@@ -19,7 +19,18 @@ Completeness
 Accuracy
   6. Each frozen invoice line re-rates to the same amount with the price book
      version it records, and that version is the one the close used.
-  7. Each invoice total = the sum of its lines, and its line count matches.
+  7. Each invoice total = the sum of its usage lines and charges, and its
+     line count matches.
+
+Subscriptions and credits (frozen and draft invoices alike)
+  8. Every subscription is charged its recorded fee exactly once, in its
+     start period, and no fee is charged for anything else.
+  9. Included credit = min(the active term's included credit, rated usage),
+     and only while a term is active.
+ 10. Every prepaid draw comes from the customer's own grant, inside the
+     grant's usable periods, and no grant is drawn past its amount.
+ 11. Credits on an invoice never exceed its rated usage, and prepaid credit
+     only covers what included credit left.
 """
 from __future__ import annotations
 
@@ -28,7 +39,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from billing import aggregate, invoice, ledger, rating
+from billing import aggregate, credits, invoice, ledger, rating, subscriptions
 
 
 @dataclass(frozen=True)
@@ -149,6 +160,7 @@ def reconcile(conn: sqlite3.Connection,
                      "aggregated", _usage_units(recomputed))
             _compare(r, "aggregated_vs_invoiced", period, "aggregated",
                      _usage_units(recomputed), "invoiced", _line_units(drafts))
+    _check_credits(r, conn, books)
     r.checked["periods"] = len(set(by_period) | set(closes))
     r.checked["closed_periods"] = len(closes)
     r.checked["events"] = len(events)
@@ -195,3 +207,63 @@ def _check_accuracy(r: Report, conn: sqlite3.Connection, period: str, close_vers
                   f"lines sum {lines_total} ({line_count} lines)", period, h["customer_id"])
     for customer in set(built) - seen:
         r.gap("invoice_missing", "lines with no invoice header", period, customer)
+
+
+def _check_credits(r: Report, conn: sqlite3.Connection,
+                   books: dict[str, rating.PriceBook]) -> None:
+    alloc = credits.allocate(conn, books)
+    subs = {s.subscription_id: s for s in subscriptions.subscriptions(conn)}
+    grants = {g.grant_id: g for g in subscriptions.grants(conn)}
+    ZERO = Decimal("0.00")
+
+    # 8. Fees
+    fees: dict[str, list[credits.Charge]] = defaultdict(list)
+    for charges in alloc.charges.values():
+        for c in charges:
+            if c.kind == "subscription_fee":
+                fees[c.ref].append(c)
+    for sub_id, sub in subs.items():
+        charged = fees.pop(sub_id, [])
+        if [(c.period, c.customer_id, c.amount) for c in charged] != [
+                (sub.start_period, sub.customer_id, sub.fee)]:
+            r.gap("subscription_fee", f"{sub_id}: expected {sub.fee} in {sub.start_period}, "
+                  f"charged {[(c.period, str(c.amount)) for c in charged]}",
+                  sub.start_period, sub.customer_id)
+    for sub_id, charged in fees.items():
+        for c in charged:
+            r.gap("subscription_fee", f"fee for unknown subscription {sub_id}",
+                  c.period, c.customer_id)
+
+    # 9-11. Credits, per invoice and per grant
+    drawn: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    for period, customer in sorted(set(alloc.charges) | set(alloc.usage)):
+        if period in alloc.errors:
+            continue   # already a gap: unrated_usage
+        charges = alloc.charges.get((period, customer), [])
+        usage = alloc.usage.get((period, customer), ZERO)
+        included = -sum((c.amount for c in charges if c.kind == "included_credit"), ZERO)
+        prepaid = -sum((c.amount for c in charges if c.kind == "prepaid_credit"), ZERO)
+        active = [s for s in subs.values() if s.customer_id == customer and s.active_in(period)]
+        expected = min(active[0].included_credit, usage) if active else ZERO
+        refs = {c.ref for c in charges if c.kind == "included_credit"}
+        if included != expected or (refs and refs != {active[0].subscription_id}):
+            r.gap("included_credit", f"applied {included}, expected {expected}", period, customer)
+        if included + prepaid > usage or prepaid > usage - included:
+            r.gap("credit_exceeds_usage", f"credits {included + prepaid} on usage {usage}",
+                  period, customer)
+        for c in charges:
+            if c.kind != "prepaid_credit":
+                continue
+            g = grants.get(c.ref)
+            if g is None or g.customer_id != customer or not g.usable_in(period) or c.amount > 0:
+                r.gap("prepaid_credit", f"draw {c.amount} from {c.ref} not allowed here",
+                      period, customer)
+                continue
+            drawn[c.ref] -= c.amount
+    for grant_id, total in drawn.items():
+        g = grants[grant_id]
+        if total > g.amount:
+            r.gap("grant_overdrawn", f"{grant_id}: drawn {total} of {g.amount}",
+                  None, g.customer_id)
+    r.checked["subscriptions"] = len(subs)
+    r.checked["credit_grants"] = len(grants)

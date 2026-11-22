@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from billing import aggregate, rating
+from billing import aggregate, credits, rating
 
 
 @dataclass(frozen=True)
@@ -23,29 +23,43 @@ class Invoice:
     period: str
     customer_id: str
     lines: tuple[rating.RatedLine, ...]
+    # Subscription fees and credits (see credits.py). Empty for a plain
+    # pay-as-you-go customer, so their invoices are exactly as in Phase 2.
+    charges: tuple[credits.Charge, ...] = ()
+
+    @property
+    def usage_total(self) -> Decimal:
+        return sum((line.amount for line in self.lines), Decimal("0.00"))
 
     @property
     def total(self) -> Decimal:
-        return sum((line.amount for line in self.lines), Decimal("0.00"))
+        """Usage lines plus charges, each already whole cents: never re-rounded."""
+        return self.usage_total + sum((c.amount for c in self.charges), Decimal("0.00"))
 
     @property
     def tokens(self) -> int:
         return sum(line.tokens for line in self.lines)
 
 
-def build(lines: list[rating.RatedLine]) -> list[Invoice]:
-    """Group rated lines into invoices, one per (period, customer)."""
+def build(lines: list[rating.RatedLine],
+          charges: list[credits.Charge] | tuple[credits.Charge, ...] = ()) -> list[Invoice]:
+    """Group rated lines and charges into invoices, one per (period, customer)."""
     grouped: dict[tuple[str, str], list[rating.RatedLine]] = {}
     for line in lines:
         grouped.setdefault((line.period, line.customer_id), []).append(line)
-    return [Invoice(p, c, tuple(ls)) for (p, c), ls in sorted(grouped.items())]
+    by_key: dict[tuple[str, str], list[credits.Charge]] = {}
+    for c in charges:
+        by_key.setdefault((c.period, c.customer_id), []).append(c)
+    return [Invoice(p, c, tuple(grouped.get((p, c), ())), tuple(by_key.get((p, c), ())))
+            for p, c in sorted(set(grouped) | set(by_key))]
 
 
 def draft(conn: sqlite3.Connection, period: str,
           book: rating.PriceBook | None = None) -> list[Invoice]:
     """What the period's invoices would be if it closed now. Writes nothing."""
     book = book or rating.book_for_period(period)
-    return build(rating.rate(aggregate.aggregate(conn, period), book))
+    lines = rating.rate(aggregate.aggregate(conn, period), book)
+    return build(lines, credits.allocate(conn, overrides={period: book}).for_period(period))
 
 
 class PeriodCloseError(Exception):
@@ -77,7 +91,8 @@ def close_period(conn: sqlite3.Connection, period: str, *,
             raise PeriodCloseError("closed_at must be after every event already received")
 
         usage = aggregate.aggregate(conn, period)
-        invoices = build(rating.rate(usage, book))
+        charges = credits.allocate(conn, overrides={period: book}).for_period(period)
+        invoices = build(rating.rate(usage, book), charges)
         conn.executemany(
             "INSERT INTO period_aggregates (period, customer_id, model, input_tokens,"
             " output_tokens, event_count, late_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -96,6 +111,11 @@ def close_period(conn: sqlite3.Connection, period: str, *,
             " free_tokens, amount, price_book_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [(ln.period, ln.customer_id, ln.model, ln.category, ln.tokens, ln.free_tokens,
               str(ln.amount), ln.price_book_version) for inv in invoices for ln in inv.lines],
+        )
+        conn.executemany(
+            "INSERT INTO invoice_charges (period, customer_id, kind, ref, amount)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [(c.period, c.customer_id, c.kind, c.ref, str(c.amount)) for c in charges],
         )
         conn.executemany(
             "INSERT INTO invoices (period, customer_id, total, line_count) VALUES (?, ?, ?, ?)",
@@ -145,4 +165,4 @@ def stored(conn: sqlite3.Connection, period: str) -> list[Invoice]:
     order = {c: i for i, c in enumerate(aggregate.CATEGORIES)}
     lines.sort(key=lambda ln: (ln.customer_id, ln.model, order.get(ln.category, len(order)),
                                ln.category))
-    return build(lines)
+    return build(lines, credits.frozen_charges(conn, period))
