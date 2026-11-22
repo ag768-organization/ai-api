@@ -12,7 +12,8 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
+from pydantic import (BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr,
+                      field_validator)
 
 # GUESS: a fixed model catalogue. Pricing per model arrives in Phase 2.
 KNOWN_MODELS: frozenset[str] = frozenset({"tiny-1", "small-1", "medium-1", "large-1"})
@@ -24,6 +25,17 @@ MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 # GUESS: a single call can't exceed 2M tokens. Guards against garbage input.
 MAX_TOKENS_PER_FIELD = 2_000_000
+
+# Token fields on an event, in ledger column order. `input_tokens` is new
+# (uncached) input; cache writes and cache reads are counted separately
+# because they are priced as multiples of the input rate.
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens")
+
+# Fields added after Phase 2, with the value an event that predates them is
+# read as. `payload_hash` leaves a field out while it holds this value, so
+# every event already in a ledger keeps its hash, and re-sending an old event
+# without the new fields is still a duplicate, not a conflict.
+NEW_FIELD_DEFAULTS = {"cache_write_tokens": 0, "cache_read_tokens": 0, "batch": False}
 
 
 class UsageEvent(BaseModel):
@@ -40,6 +52,12 @@ class UsageEvent(BaseModel):
     model: StrictStr
     input_tokens: StrictInt = Field(ge=0, le=MAX_TOKENS_PER_FIELD)
     output_tokens: StrictInt = Field(ge=0, le=MAX_TOKENS_PER_FIELD)
+    # GUESS: one kind of cache write (no separate short and long TTL prices).
+    cache_write_tokens: StrictInt = Field(default=0, ge=0, le=MAX_TOKENS_PER_FIELD)
+    cache_read_tokens: StrictInt = Field(default=0, ge=0, le=MAX_TOKENS_PER_FIELD)
+    # Sent through the batch interface: every token category gets the batch
+    # discount, on top of any cache multiplier.
+    batch: StrictBool = False
     occurred_at: datetime
 
     @field_validator("event_id")
@@ -80,12 +98,16 @@ class UsageEvent(BaseModel):
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return sum(getattr(self, f) for f in TOKEN_FIELDS)
 
     def payload_hash(self) -> str:
         """Stable hash of the billable content, used to tell an exact
-        duplicate (safe to drop) from a conflicting re-use of an event_id."""
-        body = {
+        duplicate (safe to drop) from a conflicting re-use of an event_id.
+
+        Fields in NEW_FIELD_DEFAULTS join the hash only when they differ from
+        their default, so the hash of an event that doesn't use them is the
+        same as it was before they existed (see tests/test_cache_batch.py)."""
+        body: dict[str, object] = {
             "event_id": self.event_id,
             "customer_id": self.customer_id,
             "model": self.model,
@@ -93,4 +115,8 @@ class UsageEvent(BaseModel):
             "output_tokens": self.output_tokens,
             "occurred_at": self.occurred_at.isoformat(),
         }
+        for name, default in NEW_FIELD_DEFAULTS.items():
+            value = getattr(self, name)
+            if value != default:
+                body[name] = value
         return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()

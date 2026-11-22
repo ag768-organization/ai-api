@@ -37,13 +37,17 @@ def generate(
     conflict_rate: float = 0.0,
     invalid_rate: float = 0.0,
     late_rate: float = 0.0,
+    cache_rate: float = 0.0,
+    batch_rate: float = 0.0,
     now: datetime | None = None,
     customers: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return `n` clean events plus injected faults appended in random order.
 
     Rates are fractions of `n`. Late events are clean events stamped 1–40
-    days in the past.
+    days in the past. Cache events get cache write and read tokens; batch
+    events are flagged `batch`. Both default to 0, and the generator draws
+    nothing extra for a zero rate, so older seeds give the same output.
     """
     rng = random.Random(seed)
     now = now or datetime.now(timezone.utc)
@@ -53,6 +57,13 @@ def generate(
 
     for e in rng.sample(events, int(n * late_rate)):
         e["occurred_at"] = (now - timedelta(days=rng.randint(1, 40))).isoformat()
+    if cache_rate:
+        for e in rng.sample(events, int(n * cache_rate)):
+            e["cache_write_tokens"] = rng.randint(0, 20_000)
+            e["cache_read_tokens"] = rng.randint(0, 200_000)
+    if batch_rate:
+        for e in rng.sample(events, int(n * batch_rate)):
+            e["batch"] = True
 
     extras: list[dict[str, Any]] = []
     for e in rng.choices(events, k=int(n * dup_rate)) if events else []:

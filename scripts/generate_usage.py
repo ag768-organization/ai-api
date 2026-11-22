@@ -27,12 +27,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--conflict-rate", type=float, default=0.0)
     p.add_argument("--invalid-rate", type=float, default=0.0)
     p.add_argument("--late-rate", type=float, default=0.0)
+    p.add_argument("--cache-rate", type=float, default=0.0, help="share of events with cache tokens")
+    p.add_argument("--batch-rate", type=float, default=0.0, help="share of events sent as batch")
     p.add_argument("--out", help="write raw events as JSON to this file")
     p.add_argument("--db", help="ingest into this SQLite ledger")
     a = p.parse_args(argv)
 
     events = emit.generate(a.n, seed=a.seed, dup_rate=a.dup_rate, conflict_rate=a.conflict_rate,
-                           invalid_rate=a.invalid_rate, late_rate=a.late_rate)
+                           invalid_rate=a.invalid_rate, late_rate=a.late_rate,
+                           cache_rate=a.cache_rate, batch_rate=a.batch_rate)
     if a.out:
         Path(a.out).write_text(json.dumps(events, indent=2))
         print(f"wrote {len(events)} raw events to {a.out}")

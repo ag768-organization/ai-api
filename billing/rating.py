@@ -7,9 +7,18 @@ per model and per token category (`input`, `output`):
 - `tiers`: graduated volume tiers, priced per million tokens. `up_to` counts
   billable tokens (after the allowance); the last tier has `up_to: null`.
 
-Token categories are a map, not fixed columns, so later categories (cache
-writes, cache reads) can be added to a new price book version without
-changing this module's shape.
+Only `input` and `output` are priced directly. From price book v2, a
+`modifiers` block derives every other category from them (**[GUESS]** on
+all of these rules):
+
+- `cache_write` and `cache_read` are the model's input rate times a per-model
+  multiplier, tier for tier.
+- `batch_<category>` is that category's rate times one book-wide
+  `batch_multiplier` (so batch combines with the cache multipliers).
+- Derived categories get no free allowance, and each counts its own tiers.
+
+A book without `modifiers` (v1) cannot rate a derived category: rating
+cache or batch tokens on it raises instead of billing them at zero.
 
 Money rules (CLAUDE.md invariant 3): Decimal end to end, prices must be JSON
 strings (a float in a price book is rejected), and each line is rounded to
@@ -23,11 +32,15 @@ from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Iterable
 
+from billing.aggregate import CATEGORIES as ALL_CATEGORIES
 from billing.aggregate import Usage
 from billing.events import KNOWN_MODELS
 
 PRICE_BOOK_DIR = Path(__file__).parent / "price_books"
+# Categories a price book prices directly. Each gets a line on every invoice,
+# even at zero tokens; derived categories get a line only when used.
 CATEGORIES = ("input", "output")
+DERIVED_CATEGORIES = tuple(c for c in ALL_CATEGORIES if c not in CATEGORIES)
 CENT = Decimal("0.01")
 PER_MILLION = 1_000_000
 
@@ -49,19 +62,74 @@ class Rate:
 
 
 @dataclass(frozen=True)
+class Modifiers:
+    batch_multiplier: Decimal
+    cache_write: dict[str, Decimal]     # model -> multiple of the input rate
+    cache_read: dict[str, Decimal]
+
+
+@dataclass(frozen=True)
 class PriceBook:
     version: str
     effective_from: str        # first period ('YYYY-MM') this book applies to
     rates: dict[str, dict[str, Rate]]   # model -> category -> Rate
+    modifiers: Modifiers | None = None
 
     def rate(self, model: str, category: str) -> Rate:
-        return self.rates[model][category]
+        if category in CATEGORIES:
+            return self.rates[model][category]
+        if category not in DERIVED_CATEGORIES:
+            raise PriceBookError(f"unknown token category {category!r}")
+        if self.modifiers is None:
+            raise PriceBookError(f"price book {self.version} has no price for {category}")
+        base = category.removeprefix("batch_")
+        multiplier = Decimal(1)
+        if base == "cache_write":
+            base, multiplier = "input", self.modifiers.cache_write[model]
+        elif base == "cache_read":
+            base, multiplier = "input", self.modifiers.cache_read[model]
+        if category.startswith("batch_"):
+            multiplier *= self.modifiers.batch_multiplier
+        # Exact Decimal products: no rounding until the line total.
+        tiers = tuple(Tier(t.up_to, t.per_million * multiplier)
+                      for t in self.rates[model][base].tiers)
+        return Rate(0, tiers)
 
 
 def _int(v: Any, what: str) -> int:
     if not isinstance(v, int) or isinstance(v, bool) or v < 0:
         raise PriceBookError(f"{what} must be a non-negative integer")
     return v
+
+
+def _decimal(v: Any, what: str) -> Decimal:
+    if not isinstance(v, str):
+        raise PriceBookError(f"{what} must be a string, got {v!r}")
+    try:
+        dec = Decimal(v)
+    except ArithmeticError as exc:
+        raise PriceBookError(f"{what}: bad number {v!r}") from exc
+    if not dec.is_finite() or dec < 0:
+        raise PriceBookError(f"{what}: bad number {v!r}")
+    return dec
+
+
+def parse_modifiers(data: Any, version: str) -> Modifiers:
+    if not isinstance(data, dict) or set(data) != {"batch_multiplier", "cache"}:
+        raise PriceBookError(f"{version}: modifiers needs batch_multiplier and cache")
+    batch = _decimal(data["batch_multiplier"], f"{version}: batch_multiplier")
+    if not 0 < batch <= 1:
+        raise PriceBookError(f"{version}: batch_multiplier must be in (0, 1]")
+    cache = data["cache"]
+    if not isinstance(cache, dict) or set(cache) != set(KNOWN_MODELS):
+        raise PriceBookError(f"{version}: cache must cover exactly {sorted(KNOWN_MODELS)}")
+    write, read = {}, {}
+    for model, spec in cache.items():
+        if not isinstance(spec, dict) or set(spec) != {"write_multiplier", "read_multiplier"}:
+            raise PriceBookError(f"{version}/{model}: cache needs write_ and read_multiplier")
+        write[model] = _decimal(spec["write_multiplier"], f"{version}/{model}: write_multiplier")
+        read[model] = _decimal(spec["read_multiplier"], f"{version}/{model}: read_multiplier")
+    return Modifiers(batch, write, read)
 
 
 def parse_price_book(data: dict[str, Any]) -> PriceBook:
@@ -107,7 +175,8 @@ def parse_price_book(data: dict[str, Any]) -> PriceBook:
                 tiers.append(Tier(up_to, dec))
             rates[model][cat] = Rate(_int(spec.get("free_tokens", 0), f"{where}: free_tokens"),
                                      tuple(tiers))
-    return PriceBook(version, effective_from, rates)
+    modifiers = parse_modifiers(data["modifiers"], version) if "modifiers" in data else None
+    return PriceBook(version, effective_from, rates, modifiers)
 
 
 def load_price_book(path: str | Path) -> PriceBook:
@@ -168,12 +237,15 @@ class RatedLine:
 
 
 def rate(usage: Iterable[Usage], book: PriceBook) -> list[RatedLine]:
-    """One line per (usage row, token category), including zero-token lines,
-    so units reconcile line for line."""
+    """One line per (usage row, token category): always for input and output
+    (even at zero, so units reconcile line for line), and for a derived
+    category whenever it has tokens."""
     lines = []
     for u in usage:
-        for cat in CATEGORIES:
-            tokens = u.input_tokens if cat == "input" else u.output_tokens
+        for cat in ALL_CATEGORIES:
+            tokens = u.tokens(cat)
+            if cat not in CATEGORIES and tokens == 0:
+                continue
             exact, free = exact_amount(tokens, book.rate(u.model, cat))
             lines.append(RatedLine(u.period, u.customer_id, u.model, cat, tokens, free,
                                    round_line(exact), book.version))

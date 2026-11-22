@@ -3,6 +3,9 @@
 Every check below must come out exact. Any difference is a gap, and any gap
 fails the run; there are no warnings.
 
+Units are compared per customer, model and token category: input, output,
+cache writes, cache reads and the batch version of each.
+
 Completeness
   1. Each ingest batch balances: received = accepted + duplicate + conflict
      + invalid.
@@ -50,28 +53,32 @@ class Report:
         self.gaps.append(Gap(check, period, customer_id, detail))
 
 
-# (customer, model, category) -> tokens
+# (customer, model, category) -> tokens. Every check compares all token
+# categories (input, output, cache and batch), with a missing key read as 0.
 Units = dict[tuple[str, str, str], int]
 
 
 def _usage_units(usage: list[aggregate.Usage]) -> Units:
-    out: Units = {}
+    out: Units = defaultdict(int)
     for u in usage:
-        out[(u.customer_id, u.model, "input")] = u.input_tokens
-        out[(u.customer_id, u.model, "output")] = u.output_tokens
-    return out
+        for cat in aggregate.CATEGORIES:
+            out[(u.customer_id, u.model, cat)] += u.tokens(cat)
+    return dict(out)
 
 
 def _line_units(invoices: list[invoice.Invoice]) -> Units:
-    return {(ln.customer_id, ln.model, ln.category): ln.tokens
-            for inv in invoices for ln in inv.lines}
+    out: Units = defaultdict(int)
+    for inv in invoices:
+        for ln in inv.lines:
+            out[(ln.customer_id, ln.model, ln.category)] += ln.tokens
+    return dict(out)
 
 
 def _raw_units(events: list[aggregate.AssignedEvent]) -> Units:
     out: Units = defaultdict(int)
     for e in events:
-        out[(e.customer_id, e.model, "input")] += e.input_tokens
-        out[(e.customer_id, e.model, "output")] += e.output_tokens
+        for cat, n in e.units().items():
+            out[(e.customer_id, e.model, cat)] += n
     return dict(out)
 
 
@@ -120,10 +127,7 @@ def reconcile(conn: sqlite3.Connection,
         recomputed = aggregate.summarise(by_period.get(period, []))
         if period in closes:
             # 4. Closed period: ledger vs frozen aggregates vs frozen lines
-            frozen = [aggregate.Usage(**dict(row)) for row in conn.execute(
-                "SELECT period, customer_id, model, input_tokens, output_tokens,"
-                " event_count, late_count FROM period_aggregates WHERE period = ?"
-                " ORDER BY customer_id, model", (period,))]
+            frozen = invoice.frozen_usage(conn, period)
             invoices = invoice.stored(conn, period)
             _compare(r, "raw_vs_aggregated", period, "raw", raw,
                      "aggregated", _usage_units(frozen))
@@ -134,8 +138,13 @@ def reconcile(conn: sqlite3.Connection,
             _check_accuracy(r, conn, period, closes[period], invoices, books)
         else:
             # 5. Open period: raw vs aggregated vs draft invoice
-            book = rating.book_for_period(period, books)
-            drafts = invoice.build(rating.rate(recomputed, book))
+            try:
+                book = rating.book_for_period(period, books)
+                drafts = invoice.build(rating.rate(recomputed, book))
+            except rating.PriceBookError as exc:
+                # e.g. cache tokens in a period whose book has no cache price
+                r.gap("unrated_usage", str(exc), period)
+                drafts = []
             _compare(r, "raw_vs_aggregated", period, "raw", raw,
                      "aggregated", _usage_units(recomputed))
             _compare(r, "aggregated_vs_invoiced", period, "aggregated",
@@ -160,7 +169,12 @@ def _check_accuracy(r: Report, conn: sqlite3.Connection, period: str, close_vers
             if book is None:
                 r.gap("price_book_missing", f"no price book {ln.price_book_version}", period)
                 continue
-            exact, free = rating.exact_amount(ln.tokens, book.rate(ln.model, ln.category))
+            try:
+                exact, free = rating.exact_amount(ln.tokens, book.rate(ln.model, ln.category))
+            except (rating.PriceBookError, KeyError) as exc:
+                r.gap("line_amount", f"{ln.model}/{ln.category}: cannot re-rate ({exc})",
+                      period, ln.customer_id)
+                continue
             if (rating.round_line(exact), free) != (ln.amount, ln.free_tokens):
                 r.gap("line_amount", f"{ln.model}/{ln.category}: stored {ln.amount} "
                       f"re-rated {rating.round_line(exact)}", period, ln.customer_id)
