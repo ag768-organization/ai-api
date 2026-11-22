@@ -20,8 +20,9 @@ employer or client, or anything not drawn from public material.
 - Python 3.11+, FastAPI, Pydantic v2, SQLite (stdlib `sqlite3`), pytest.
 - No ORM. SQL lives next to the code that uses it.
 - pip + `pyproject.toml` (editable install with the `dev` extra).
-- Planned, not yet installed: Hypothesis (property tests, Phase 2), ruff
-  (lint and format) and mypy (type checks). **[GUESS: ruff and mypy]**
+- Hypothesis for property tests (dev extra).
+- Planned, not yet installed: ruff (lint and format) and mypy (type checks).
+  **[GUESS: ruff and mypy]**
 
 ## Layout
 
@@ -29,13 +30,19 @@ employer or client, or anything not drawn from public material.
   - `events.py`  usage event schema and validation rules
   - `emit.py`    fake usage generator (seeded)
   - `ingest.py`  validation + de-duplication by `event_id`
-  - `ledger.py`  append-only SQLite ledger of raw events
-  - Phase 2 adds `aggregate.py`, `rating.py`, `invoice.py`, `reconcile.py`,
-    and versioned price books (data, not code). **[GUESS: file names]**
+  - `ledger.py`  append-only SQLite ledger of raw events, plus the
+    append-only downstream tables (ingest batches, period closes, frozen
+    aggregates, invoice lines, invoices)
+  - `aggregate.py` billing-period assignment (incl. late events) and totals
+  - `rating.py`  price book loading and rating; `diff_books` for differential runs
+  - `invoice.py` invoices, drafts, and `close_period` (the one-way freeze)
+  - `reconcile.py` the daily completeness and accuracy check
+  - `price_books/*.json` versioned price books (data, not code). All numbers
+    are synthetic. **[GUESS: v1 prices, tiers and free allowances]**
 - `app/` is the FastAPI app (fake model endpoint + ingest endpoint).
 - `scripts/` holds command-line helpers, e.g. `generate_usage.py`.
-- `tests/` is the pytest suite. Phase 2 adds `tests/property/` and
-  `tests/differential/`. **[GUESS]**
+- `tests/` is the pytest suite, with `tests/property/` (Hypothesis,
+  invariants 6 to 9) and `tests/differential/` (old vs new pricing).
 - `.github/` is high risk: CI workflows and CODEOWNERS (Phase 4).
 - `.claude/` holds skills (`verify`), hooks and settings (Phases 3 and 5).
 - `REVIEW.md` holds review rules, read from `main`, never from the PR (Phase 4).
@@ -43,7 +50,8 @@ employer or client, or anything not drawn from public material.
 ## Pipeline
 
 Each step has one module and one job. A later step never reaches back and
-changes an earlier step's data. Phase 1 builds steps 1 to 3.
+changes an earlier step's data. Phase 1 built steps 1 to 3; Phase 2 builds 4
+to 7.
 
 1. **Emit.** Every API call produces a usage event: `event_id` (UUID),
    `customer_id` (`cust_...`), `model` (from a fixed catalogue),
@@ -57,13 +65,20 @@ changes an earlier step's data. Phase 1 builds steps 1 to 3.
 3. **Ledger.** Raw events go into the append-only `usage_events` table.
 4. **Aggregate.** Total tokens per customer, per model, per billing period.
    - Billing period: calendar month, UTC. **[GUESS]**
-   - Late events: an event whose `occurred_at` falls in a period that is
-     already closed is billed in the next open period and flagged late.
-     Closed periods are never reopened. The ledger keeps the true
-     `occurred_at` and `received_at`, so the shift is visible and auditable.
+   - Late events: an event whose `occurred_at` falls in a period that was
+     already closed when it was *received* is billed in the next period that
+     was open at that moment, and flagged late. Closed periods are never
+     reopened. The ledger keeps the true `occurred_at` and `received_at`, so
+     the shift is visible and auditable.
+   - A period closes with `close_period` only after it has ended, and never
+     with a `closed_at` before an event already received.
 5. **Rate.** Apply price per million tokens per model (input and output
    separately), volume tiers and any free allowance. Every rated line records
    the price book version used.
+   - Free allowance is per customer, model, token category and period, and
+     comes off first; tier limits count tokens after it. **[GUESS]**
+   - A period is rated on the book with the latest `effective_from` on or
+     before it; no mid-period price changes. **[GUESS]**
 6. **Invoice.** Line items and a total per customer per period. The invoice
    total equals the sum of its line items exactly.
 7. **Reconcile.** A daily job checks that raw ledger units = aggregated units
@@ -89,9 +104,6 @@ changes an earlier step's data. Phase 1 builds steps 1 to 3.
 5. **Every rejected event is counted, not silently dropped.** Ingest returns
    accepted / duplicate / conflict / invalid counts so reconciliation can
    account for every input.
-
-Added for Phase 2 (from the other draft):
-
 6. **Invoice total == sum of rated usage** for the period.
 7. **Replay never changes totals.** Replaying the same events, in any order
    and with any number of duplicates, leaves every total unchanged.
@@ -122,6 +134,9 @@ python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 pytest -q                                   # run tests
 python scripts/generate_usage.py -n 1000 --dup-rate 0.05 --db usage.db
+python scripts/close_period.py --db usage.db --period 2026-10   # one-way
+python scripts/reconcile.py --db usage.db   # exits 1 on any gap
+python scripts/diff_pricing.py --old v1 --new candidate.json   # pricing PRs
 uvicorn app.main:app --reload               # run the API
 ```
 
@@ -134,9 +149,10 @@ uvicorn app.main:app --reload               # run the API
 - Tests use a fresh in-memory or temp SQLite database, never a real `.db`
   file in the repo.
 - The generator takes a seed, so any failure can be reproduced.
-- Phase 2: property tests (Hypothesis) cover invariants 6 to 9; differential
-  tests run old and new pricing on the same generated usage and compare
-  totals per customer.
+- Property tests (Hypothesis) cover invariants 6 to 9; differential tests
+  run old and new pricing on the same generated usage and compare totals per
+  customer. Hypothesis tests build their own in-memory DB inside the test
+  body, not via a fixture.
 
 ## Commits and PRs
 
