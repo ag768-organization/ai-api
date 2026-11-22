@@ -47,7 +47,9 @@ employer or client, or anything not drawn from public material.
     are synthetic. **[GUESS: v1 prices, tiers and free allowances; v2
     cache multipliers and batch multiplier]**
 - `app/` is the FastAPI app (fake model endpoint + ingest endpoint).
-- `scripts/` holds command-line helpers, e.g. `generate_usage.py`.
+- `scripts/` holds command-line helpers, e.g. `generate_usage.py`, and
+  `verify.py` (the end-to-end run behind `/verify`).
+- `RELIABILITY.md` is the reliability checklist, seeded from real bugs.
 - `tests/` is the pytest suite, with `tests/property/` (Hypothesis,
   invariants 6 to 9) and `tests/differential/` (old vs new pricing).
 - `.github/` is high risk: CI workflows and CODEOWNERS (Phase 4).
@@ -161,7 +163,8 @@ When a change touches either path:
 
 - Say so at the top of the PR description and explain the billing impact.
 - Add or update the test first; it must fail without the change.
-- Run the full test suite (and `/verify` once it exists) before committing.
+- Run the full test suite and `/verify` before committing, and walk
+  `RELIABILITY.md` against the diff.
 - If pricing or rating changed, run the differential test against the
   previous price book and put the summary in the PR.
 - Do not weaken a CI check, CODEOWNERS rule, branch protection or hook to get
@@ -180,6 +183,7 @@ python scripts/close_period.py --db usage.db --period 2026-10   # one-way
 python scripts/reconcile.py --db usage.db   # exits 1 on any gap
 python scripts/revrec.py --db usage.db --through 2026-11   # revenue + deferred
 python scripts/diff_pricing.py --old v1 --new candidate.json   # pricing PRs
+python scripts/verify.py                    # /verify: whole pipeline, exits 1 on any gap
 uvicorn app.main:app --reload               # run the API
 ```
 
