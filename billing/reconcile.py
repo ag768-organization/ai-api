@@ -31,6 +31,16 @@ Subscriptions and credits (frozen and draft invoices alike)
      grant's usable periods, and no grant is drawn past its amount.
  11. Credits on an invoice never exceed its rated usage, and prepaid credit
      only covers what included credit left.
+
+Revenue recognition (revrec.py)
+ 12. Each subscription's recognized pieces add up to its fee exactly and
+     fall inside its term.
+ 13. Each grant: drawn + breakage + still deferred = amount, and nothing is
+     left deferred once its last period has closed.
+ 14. Per invoice: usage + prepaid_usage revenue = rated usage - included
+     credit. No revenue line is negative.
+ 15. Rollforward through every period: billed + prepaid cash = recognized +
+     deferred.
 """
 from __future__ import annotations
 
@@ -39,7 +49,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from billing import aggregate, credits, invoice, ledger, rating, subscriptions
+from billing import aggregate, credits, invoice, ledger, rating, revrec, subscriptions
 
 
 @dataclass(frozen=True)
@@ -161,6 +171,7 @@ def reconcile(conn: sqlite3.Connection,
             _compare(r, "aggregated_vs_invoiced", period, "aggregated",
                      _usage_units(recomputed), "invoiced", _line_units(drafts))
     _check_credits(r, conn, books)
+    _check_revenue(r, conn, books)
     r.checked["periods"] = len(set(by_period) | set(closes))
     r.checked["closed_periods"] = len(closes)
     r.checked["events"] = len(events)
@@ -267,3 +278,60 @@ def _check_credits(r: Report, conn: sqlite3.Connection,
                   None, g.customer_id)
     r.checked["subscriptions"] = len(subs)
     r.checked["credit_grants"] = len(grants)
+
+
+def _check_revenue(r: Report, conn: sqlite3.Connection,
+                   books: dict[str, rating.PriceBook]) -> None:
+    ZERO = Decimal("0.00")
+    sched = revrec.schedule(conn, books)
+    closed = aggregate.closes(conn)
+    by_ref: dict[tuple[str, str], Decimal] = defaultdict(lambda: ZERO)
+    for ln in sched.lines:
+        if ln.amount < 0:
+            r.gap("revenue_negative", f"{ln.kind} {ln.ref} {ln.amount}", ln.period, ln.customer_id)
+        by_ref[(ln.kind, ln.ref)] += ln.amount
+
+    # 12. Subscriptions
+    for s in subscriptions.subscriptions(conn):
+        pieces = [ln for ln in sched.lines if ln.kind == "subscription"
+                  and ln.ref == s.subscription_id]
+        if (sum((ln.amount for ln in pieces), ZERO) != s.fee
+                or any(not s.active_in(ln.period) for ln in pieces)):
+            r.gap("revenue_subscription", f"{s.subscription_id}: recognized "
+                  f"{[(ln.period, str(ln.amount)) for ln in pieces]} of {s.fee}",
+                  s.start_period, s.customer_id)
+
+    # 13. Prepaid grants
+    for g in subscriptions.grants(conn):
+        drawn = by_ref[("prepaid_usage", g.grant_id)]
+        broken = by_ref[("breakage", g.grant_id)]
+        deferred = g.amount - drawn - broken
+        if deferred < 0 or (g.last_period in closed and deferred != 0) or (
+                broken and g.last_period not in closed):
+            r.gap("revenue_prepaid", f"{g.grant_id}: amount {g.amount}, drawn {drawn}, "
+                  f"breakage {broken}, deferred {deferred}", g.last_period, g.customer_id)
+
+    # 14. Usage revenue per invoice
+    usage_rev: dict[tuple[str, str], Decimal] = defaultdict(lambda: ZERO)
+    for ln in sched.lines:
+        if ln.kind in ("usage", "prepaid_usage"):
+            usage_rev[(ln.period, ln.customer_id)] += ln.amount
+    alloc = sched.alloc
+    for key in sorted(set(alloc.usage) | set(alloc.charges) | set(usage_rev)):
+        if key[0] in alloc.errors:
+            continue
+        included = -sum((c.amount for c in alloc.charges.get(key, [])
+                         if c.kind == "included_credit"), ZERO)
+        expected = alloc.usage.get(key, ZERO) - included
+        if usage_rev[key] != expected:
+            r.gap("revenue_usage", f"recognized {usage_rev[key]}, expected {expected}", *key)
+
+    # 15. Rollforward
+    periods = sorted({ln.period for ln in sched.lines} | {k[0] for k in alloc.usage})
+    for period in periods:
+        rf = revrec.rollforward(conn, period, sched)
+        if not rf.balances:
+            r.gap("revenue_rollforward", f"billed {rf.billed} + cash {rf.prepaid_cash} != "
+                  f"recognized {rf.recognized} + deferred "
+                  f"{rf.deferred_subscription + rf.deferred_prepaid}", period)
+    r.checked["revenue_lines"] = len(sched.lines)
